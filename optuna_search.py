@@ -32,6 +32,9 @@ SEARCH_SPACE_TYPES = {
     "use_norm": int,
     "patch_len": int,
     "stride": int,
+    "stid_hidden_dim": int,
+    "stid_num_layers": int,
+    "stid_train_noise_std": float,
     "gcn_true": int,
     "buildA_true": int,
     "gcn_depth": int,
@@ -51,6 +54,12 @@ SEARCH_SPACE_TYPES = {
     "batch_size": int,
     "patience": int,
     "learning_rate": float,
+    "weight_decay": float,
+    "huber_delta": float,
+    "grad_clip": float,
+    "stid_reduce_lr_patience": int,
+    "stid_reduce_lr_factor": float,
+    "stid_min_lr": float,
     "lradj": str,
 }
 
@@ -63,12 +72,12 @@ BOOLEAN_SEARCH_FIELDS = {
     "layer_norm_affline",
 }
 
-OBJECTIVE_CHOICES = ("val_loss", "mae", "mse", "rmse", "mape", "mspe")
+OBJECTIVE_CHOICES = ("val_loss", "mae", "mse", "rmse")
 
 
 def build_parser():
     parser = build_train_parser()
-    parser.description = "Optuna search for thw pipeline"
+    parser.description = "Optuna Hyperparameter search"
     parser.add_argument("--trials", type=int, default=20, help="Number of trials")
     parser.add_argument("--study_name", type=str, default="optuna_study", help="Study name")
     parser.add_argument(

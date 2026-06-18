@@ -9,7 +9,7 @@ import numpy as np
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Visualize forecasts")
-    parser.add_argument("--run_dir", type=str, required=True, help="Folder with input.npy, pred.npy, true.npy, metadata.json")
+    parser.add_argument("--run_dir", type=str, required=True)
     parser.add_argument("--sample_idx", type=int, default=0, help="First test-window index to plot")
     parser.add_argument("--num_samples", type=int, default=6, help="Number of forecast windows to place into one PNG")
     parser.add_argument(
@@ -195,6 +195,13 @@ def plot_sample(ax, sample_index, channel_label, input_history, true, pred):
     )
 
 
+def select_input_history(inputs, sample_index, channel_idx):
+    sample = inputs[sample_index]
+    if sample.ndim == 3:
+        return sample.mean(axis=(1, 2))
+    return sample[:, channel_idx]
+
+
 def main():
     args = build_parser().parse_args()
 
@@ -237,7 +244,7 @@ def main():
         ax_history = None
 
     for axis, sample_index in zip(sample_axes, sample_indices):
-        input_history = inputs[sample_index, :, channel_idx]
+        input_history = select_input_history(inputs, sample_index, channel_idx)
         pred = preds[sample_index, :, channel_idx]
         true = trues[sample_index, :, channel_idx]
         plot_sample(axis, sample_index, channel_label, input_history, true, pred)

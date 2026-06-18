@@ -12,11 +12,13 @@ from metrics import metric
 
 from models.MTGNN import Model as MTGNNModel
 from models.PatchTST import Model as PatchTSTModel
+from models.STID import Model as STIDModel
 from models.TimeXer import Model as TimeXerModel
 from models.TimesNet import Model as TimesNetModel
 from models.iTransformer import Model as ITransformerModel
 
 from utils import EarlyStopping, adjust_learning_rate, ensure_dir, get_device, save_json, set_seed
+from xgboost_power_stage import run_xgboost_power_stage
 
 MODEL_REGISTRY = {
     "TimesNet": TimesNetModel,
@@ -24,6 +26,7 @@ MODEL_REGISTRY = {
     "iTransformer": ITransformerModel,
     "TimeXer": TimeXerModel,
     "MTGNN": MTGNNModel,
+    "STIDEnsemble": STIDModel,
 }
 
 
@@ -65,8 +68,13 @@ def build_parser():
     parser.add_argument("--use_norm", type=int, default=1)
     parser.add_argument("--patch_len", type=int, default=16)
     parser.add_argument("--stride", type=int, default=8)
+    parser.add_argument("--stid_hidden_dim", type=int, default=128)
+    parser.add_argument("--stid_num_layers", type=int, default=6)
+    parser.add_argument("--stid_num_nodes", type=int, default=0)
+    parser.add_argument("--stid_in_features", type=int, default=0)
+    parser.add_argument("--stid_train_noise_std", type=float, default=0.02)
     
-    #mtgnn arguments
+    #MTGNN arguments
     parser.add_argument("--gcn_true", type=int, default=1)
     parser.add_argument("--buildA_true", type=int, default=1)
     parser.add_argument("--gcn_depth", type=int, default=2)
@@ -84,14 +92,55 @@ def build_parser():
     parser.add_argument("--layer_norm_affline", type=int, default=0)
     parser.add_argument("--txt_normalize", type=int, default=2, choices=[0, 1, 2])
 
+    #Train arguments
     parser.add_argument("--train_epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--huber_delta", type=float, default=1.0)
+    parser.add_argument("--grad_clip", type=float, default=0.0)
+    parser.add_argument("--stid_reduce_lr_patience", type=int, default=30)
+    parser.add_argument("--stid_reduce_lr_factor", type=float, default=0.5)
+    parser.add_argument("--stid_min_lr", type=float, default=1e-5)
     parser.add_argument("--lradj", type=str, default="type1")
     parser.add_argument("--seed", type=int, default=2021)
 
     parser.add_argument("--results_dir", type=str, default="./outputs")
+
+    #XGBoost arguments
+    parser.add_argument("--use_xgboost_stage", action="store_true", default=False)
+    parser.add_argument("--xgb_input_path", type=str, default=None)
+    parser.add_argument("--xgb_target_source_path", type=str, default=None)
+    parser.add_argument("--xgb_output_filename", type=str, default="predicted.csv")
+    parser.add_argument("--xgb_date_col", type=str, default="DATE")
+    parser.add_argument("--xgb_target_col", type=str, default="Target")
+    parser.add_argument("--xgb_node_target_prefix", type=str, default="NSPG")
+    parser.add_argument("--xgb_feature_prefixes", type=str, nargs="+", default=["HRWSPD", "HRWD_SIN", "HRWD_COS"])
+    parser.add_argument("--xgb_nodes", type=int, nargs="*", default=None)
+    parser.add_argument("--xgb_test_size", type=float, default=0.2)
+    parser.add_argument("--xgb_valid_from_train", type=float, default=0.2)
+    parser.add_argument("--xgb_n_estimators", type=int, default=3000)
+    parser.add_argument("--xgb_learning_rate", type=float, default=0.025)
+    parser.add_argument("--xgb_max_depth", type=int, default=4)
+    parser.add_argument("--xgb_min_child_weight", type=int, default=5)
+    parser.add_argument("--xgb_subsample", type=float, default=0.85)
+    parser.add_argument("--xgb_colsample_bytree", type=float, default=0.85)
+    parser.add_argument("--xgb_reg_alpha", type=float, default=0.05)
+    parser.add_argument("--xgb_reg_lambda", type=float, default=1.5)
+    parser.add_argument("--xgb_objective", type=str, default="reg:squarederror")
+    parser.add_argument("--xgb_tree_method", type=str, default="hist")
+    parser.add_argument("--xgb_eval_metric", type=str, default="rmse")
+    parser.add_argument("--xgb_early_stopping_rounds", type=int, default=80)
+    parser.add_argument("--xgb_n_jobs", type=int, default=-1)
+    parser.add_argument("--xgb_verbose", type=int, default=100)
+
+    #Optuna Optimizer arguments
+    parser.add_argument("--xgb_use_optuna", action="store_true", default=False)
+    parser.add_argument("--xgb_optuna_trials", type=int, default=500)
+    parser.add_argument("--xgb_optuna_show_progress", action="store_true", default=False)
+    parser.add_argument("--xgb_optuna_final_objective", type=str, default="reg:absoluteerror")
+    parser.add_argument("--xgb_optuna_final_eval_metric", type=str, default="mae")
 
     return parser
 
@@ -111,6 +160,66 @@ def select_output_slice(features: str) -> int:
 def metrics_to_array(metrics_dict) -> np.ndarray:
     ordered_keys = ["mae", "mse", "rmse", "mape", "mspe"]
     return np.array([metrics_dict[key] for key in ordered_keys], dtype=np.float32)
+
+
+def sync_model_dimensions(args, train_dataset) -> None:
+    if args.model != "STIDEnsemble":
+        return
+
+    args.stid_num_nodes = train_dataset.num_nodes
+    args.stid_in_features = train_dataset.num_features
+    args.enc_in = train_dataset.num_features
+    args.c_out = 1
+
+
+def normalize_model_output(outputs, args):
+    if outputs.dim() == 2:
+        outputs = outputs.unsqueeze(-1)
+    return outputs[:, -args.pred_len:, :]
+
+
+def select_prediction_target(outputs, batch_y, args):
+    outputs = normalize_model_output(outputs, args)
+    target = batch_y
+    if target.dim() == 2:
+        target = target.unsqueeze(-1)
+
+    if outputs.shape[-1] == 1 and target.shape[-1] == 1:
+        return outputs, target
+
+    feature_slice = select_output_slice(args.features)
+    return outputs[:, :, feature_slice:], target[:, :, feature_slice:]
+
+
+def select_array_features(array: np.ndarray, args) -> np.ndarray:
+    if array.ndim != 3 or array.shape[-1] == 1:
+        return array
+    feature_slice = select_output_slice(args.features)
+    return array[:, :, feature_slice:]
+
+
+def build_optimizer(model, args):
+    if args.model == "STIDEnsemble":
+        return optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    return optim.Adam(model.parameters(), lr=args.learning_rate)
+
+
+def build_criterion(args):
+    if args.model == "STIDEnsemble":
+        return nn.HuberLoss(delta=args.huber_delta)
+    return nn.MSELoss()
+
+
+def build_scheduler(optimizer, args):
+    if args.model != "STIDEnsemble":
+        return None
+    return optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=args.stid_reduce_lr_factor,
+        patience=args.stid_reduce_lr_patience,
+        min_lr=args.stid_min_lr,
+    )
 
 
 def save_training_history_plot(run_dir: str, history, best_epoch=None, scale_label: str = "standardized") -> None:
@@ -172,7 +281,6 @@ def save_history_artifacts(run_dir: str, history, scale_label: str = "standardiz
 
 def validate(model, loader, criterion, device, args) -> float:
     losses = []
-    feature_slice = select_output_slice(args.features)
     model.eval()
 
     with torch.no_grad():
@@ -181,8 +289,7 @@ def validate(model, loader, criterion, device, args) -> float:
             batch_y = batch_y.float().to(device)
             batch_x_mark = batch_x_mark.float().to(device)
             outputs = model(batch_x, batch_x_mark)
-            outputs = outputs[:, -args.pred_len:, feature_slice:]
-            target = batch_y[:, :, feature_slice:]
+            outputs, target = select_prediction_target(outputs, batch_y, args)
 
             losses.append(criterion(outputs, target).item())
 
@@ -191,13 +298,29 @@ def validate(model, loader, criterion, device, args) -> float:
 
 
 def train_one_run(args, epoch_callback=None):
-    available_models = list(MODEL_REGISTRY.keys())
-    if args.model not in available_models:
-        raise ValueError(f"Unknown model '{args.model}'. Available models: {available_models}")
+
+    source_root_path = args.root_path
+    source_data_path = args.data_path
 
     set_seed(args.seed)
     device = get_device()
     print(f"Using device: {device}")
+
+    run_name = build_run_name(args)
+    run_dir = os.path.join(args.results_dir, run_name)
+    ensure_dir(run_dir)
+    checkpoint_path = os.path.join(run_dir, "checkpoint.pth")
+    xgboost_stage_metadata = None
+
+    if args.use_xgboost_stage:
+        predicted_path, xgboost_stage_metadata = run_xgboost_power_stage(
+            args,
+            source_root_path=source_root_path,
+            source_data_path=source_data_path,
+            output_dir=os.path.join(run_dir, "xgboost_stage"),
+        )
+        args.root_path = os.path.dirname(predicted_path)
+        args.data_path = os.path.basename(predicted_path)
 
     (
         train_dataset,
@@ -208,21 +331,14 @@ def train_one_run(args, epoch_callback=None):
         test_loader,
     ) = create_data_loaders(args)
 
-    if train_dataset.num_features != args.enc_in:
-        raise ValueError(
-            f"enc_in={args.enc_in}, but dataset has {train_dataset.num_features} features: "
-            f"{train_dataset.feature_names}"
-        )
+    sync_model_dimensions(args, train_dataset)
+
 
     model = MODEL_REGISTRY[args.model](args).float().to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
-    criterion = nn.MSELoss()
-
-    run_name = build_run_name(args)
-    run_dir = os.path.join(args.results_dir, run_name)
-    ensure_dir(run_dir)
-    checkpoint_path = os.path.join(run_dir, "checkpoint.pth")
+    optimizer = build_optimizer(model, args)
+    criterion = build_criterion(args)
+    scheduler = build_scheduler(optimizer, args)
 
     early_stopping = EarlyStopping(patience=args.patience, verbose=True)
     train_steps = len(train_loader)
@@ -245,13 +361,13 @@ def train_one_run(args, epoch_callback=None):
                 batch_x = batch_x.float().to(device)
                 batch_y = batch_y.float().to(device)
                 batch_x_mark = batch_x_mark.float().to(device)
-                feature_slice = select_output_slice(args.features)
 
                 outputs = model(batch_x, batch_x_mark)
-                outputs = outputs[:, -args.pred_len:, feature_slice:]
-                target = batch_y[:, :, feature_slice:]
+                outputs, target = select_prediction_target(outputs, batch_y, args)
                 loss = criterion(outputs, target)
                 loss.backward()
+                if args.grad_clip > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
 
                 epoch_losses.append(loss.item())
@@ -293,7 +409,10 @@ def train_one_run(args, epoch_callback=None):
                 print("Early stopping")
                 break
 
-            adjust_learning_rate(optimizer, epoch + 1, args)
+            if scheduler is not None:
+                scheduler.step(val_loss)
+            else:
+                adjust_learning_rate(optimizer, epoch + 1, args)
 
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         metrics_bundle, arrays = test(model, test_dataset, test_loader, device, args)
@@ -317,6 +436,7 @@ def train_one_run(args, epoch_callback=None):
             "feature_names": saved_feature_names,
             "raw_feature_names": test_dataset.feature_names,
             "wind_metadata": getattr(test_dataset, "wind_metadata", None),
+            "xgboost_stage": xgboost_stage_metadata,
             "scaled_metrics": False,
             "scale_applied": not args.no_scale,
             "saved_arrays_are_inverse_scaled": True,
@@ -364,7 +484,6 @@ def test(model, test_dataset, test_loader, device, args):
     preds_inverse = []
     trues_inverse = []
     inputs_inverse = []
-    feature_slice = select_output_slice(args.features)
     scale_applied = not args.no_scale
 
     model.eval()
@@ -376,8 +495,10 @@ def test(model, test_dataset, test_loader, device, args):
             outputs = model(batch_x, batch_x_mark)
 
             input_scaled_full = batch_x.detach().cpu().numpy()
-            pred_scaled_full = outputs[:, -args.pred_len:, :].detach().cpu().numpy()
+            pred_scaled_full = normalize_model_output(outputs, args).detach().cpu().numpy()
             true_scaled_full = batch_y.detach().cpu().numpy()
+            if true_scaled_full.ndim == 2:
+                true_scaled_full = true_scaled_full[:, :, None]
 
             if scale_applied:
                 input_inverse_full = test_dataset.inverse_transform(input_scaled_full)
@@ -388,13 +509,13 @@ def test(model, test_dataset, test_loader, device, args):
                 pred_inverse_full = pred_scaled_full.copy()
                 true_inverse_full = true_scaled_full.copy()
 
-            inputs_scaled.append(input_scaled_full[:, :, feature_slice:])
-            preds_scaled.append(pred_scaled_full[:, :, feature_slice:])
-            trues_scaled.append(true_scaled_full[:, :, feature_slice:])
+            inputs_scaled.append(select_array_features(input_scaled_full, args))
+            preds_scaled.append(select_array_features(pred_scaled_full, args))
+            trues_scaled.append(select_array_features(true_scaled_full, args))
 
-            inputs_inverse.append(input_inverse_full[:, :, feature_slice:])
-            preds_inverse.append(pred_inverse_full[:, :, feature_slice:])
-            trues_inverse.append(true_inverse_full[:, :, feature_slice:])
+            inputs_inverse.append(select_array_features(input_inverse_full, args))
+            preds_inverse.append(select_array_features(pred_inverse_full, args))
+            trues_inverse.append(select_array_features(true_inverse_full, args))
 
     preds_scaled = np.concatenate(preds_scaled, axis=0)
     trues_scaled = np.concatenate(trues_scaled, axis=0)
